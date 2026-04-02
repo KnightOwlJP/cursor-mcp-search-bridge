@@ -1174,9 +1174,187 @@ def list_files(
     )
 
 
+# ============================================================================
+# ソース自動選択エンジン
+# ============================================================================
+
+# 各ソースの特性定義（自動選択の判断材料）
+_SOURCE_PROFILES = {
+    "hf": {
+        "name": "HF (Hugging Face)",
+        "description": "AI言語モデルによる技術的質問応答。一般的なプラント設計知識に強い。",
+        "strengths": ["一般知識", "技術解説", "ベストプラクティス", "規格解釈"],
+        "keywords": ["設計基準", "規格", "原理", "方法", "ベストプラクティス", "解説",
+                     "比較", "選定方法", "計算", "理論", "standard", "design", "method"],
+    },
+    "gemini": {
+        "name": "Gemini (Google)",
+        "description": "Google AIによる最新情報を含む技術応答。トレンドや最新規格に強い。",
+        "strengths": ["最新情報", "トレンド", "広範囲な知識", "多角的分析"],
+        "keywords": ["最新", "トレンド", "動向", "新技術", "比較分析", "事例", "海外",
+                     "latest", "trend", "analysis", "overview", "comparison"],
+    },
+    "local": {
+        "name": "内蔵DB (ローカルRAG)",
+        "description": "プラント設計に特化した12件の技術ドキュメント。安全系統・機器選定・設計基準を網羅。",
+        "strengths": ["安全系統", "機器選定", "配管設計", "耐震", "防食", "計装"],
+        "keywords": ["安全注入", "SIS", "ECCS", "ポンプ", "選定", "配管", "熱交換器",
+                     "バルブ", "圧力容器", "計装", "制御", "防食", "耐震", "排水",
+                     "換気", "HVAC", "ASME", "TEMA", "LOCA", "冷却"],
+    },
+    "files": {
+        "name": "ローカルファイル",
+        "description": "ローカルディスク上のドキュメント(.docx/.xlsx/.pdf/.txt)を全文検索。",
+        "strengths": ["具体的な仕様書", "報告書", "ガイドライン", "プロジェクト固有の情報"],
+        "keywords": ["仕様", "仕様書", "報告", "レポート", "ガイド", "マニュアル", "図面",
+                     "手順", "検査", "試験", "記録", "spec", "report", "guide"],
+    },
+}
+
+
+def _compute_source_relevance(query: str, source_key: str) -> float:
+    """クエリとソースの関連度スコアを算出（0.0〜1.0）"""
+    profile = _SOURCE_PROFILES.get(source_key, {})
+    keywords = profile.get("keywords", [])
+    strengths = profile.get("strengths", [])
+
+    if not keywords:
+        return 0.3  # プロファイルがなければ低めのデフォルト
+
+    query_lower = query.lower()
+    query_tokens = tokenize(query)
+    query_tokens_set = set(query_tokens)
+
+    # キーワードマッチ数
+    keyword_hits = sum(1 for kw in keywords if kw.lower() in query_lower)
+    # N-gram マッチ（日本語キーワード用）
+    ngram_hits = 0
+    for kw in keywords:
+        kw_tokens = tokenize(kw)
+        if kw_tokens and query_tokens_set & set(kw_tokens):
+            ngram_hits += 1
+
+    total_hits = keyword_hits + ngram_hits
+    max_possible = len(keywords) * 2  # keyword + ngram の最大
+
+    # スコア計算: ヒット率 + ベースライン
+    if max_possible > 0:
+        hit_ratio = total_hits / max_possible
+    else:
+        hit_ratio = 0.0
+
+    # 0.1（ベースライン）〜 1.0 の範囲にマッピング
+    score = min(1.0, 0.1 + hit_ratio * 0.9)
+    return round(score, 3)
+
+
+def _auto_select_sources(query: str, available_sources: list[str], threshold: float = 0.15) -> dict:
+    """クエリ内容に基づいて検索ソースを自動選択する
+
+    Returns:
+        {
+            "selected": ["local", "files"],
+            "scores": {"hf": 0.12, "gemini": 0.10, "local": 0.65, "files": 0.40},
+            "reasons": {"local": "キーワード一致: 安全注入, SIS, ...", ...},
+            "threshold": 0.15
+        }
+    """
+    scores = {}
+    reasons = {}
+
+    for src in available_sources:
+        score = _compute_source_relevance(query, src)
+        scores[src] = score
+
+        # 選択理由の生成
+        profile = _SOURCE_PROFILES.get(src, {})
+        matched_kws = [kw for kw in profile.get("keywords", []) if kw.lower() in query.lower()]
+        if matched_kws:
+            reasons[src] = f"キーワード一致: {', '.join(matched_kws[:5])}"
+        elif score >= threshold:
+            reasons[src] = f"N-gramマッチにより関連度 {score:.0%}"
+        else:
+            reasons[src] = "関連度が閾値未満"
+
+    selected = [src for src, score in scores.items() if score >= threshold]
+
+    # 最低1つは選択する（全て閾値未満の場合、最高スコアのソースを選択）
+    if not selected and scores:
+        best = max(scores, key=scores.get)
+        selected = [best]
+        reasons[best] += " (フォールバック: 最高関連度のため選択)"
+
+    return {
+        "selected": selected,
+        "scores": scores,
+        "reasons": reasons,
+        "threshold": threshold,
+    }
+
+
 @mcp.tool
-def search_all(query: str, sources: str = "hf,gemini,local,files") -> str:
+def recommend_sources(query: str) -> str:
+    """検索クエリに最適な情報ソースを推薦します。
+
+    search_all を実行する前に、このツールでどのソースが適切かを判断できます。
+    LLMが検索対象を絞り込みたい場合に使用してください。
+
+    各ソースの関連度スコアと選択理由が返されます。
+    結果を参考に、search_all の sources パラメータを指定してください。
+
+    Args:
+        query: 検索クエリ
+    """
+    available = list(_SOURCE_PROFILES.keys())
+    selection = _auto_select_sources(query, available)
+
+    # ソースプロファイル情報を追加
+    source_info = []
+    for src in available:
+        profile = _SOURCE_PROFILES[src]
+        source_info.append({
+            "source_key": src,
+            "name": profile["name"],
+            "description": profile["description"],
+            "strengths": profile["strengths"],
+            "relevance_score": selection["scores"].get(src, 0),
+            "selected": src in selection["selected"],
+            "reason": selection["reasons"].get(src, ""),
+        })
+
+    # スコア降順でソート
+    source_info.sort(key=lambda x: x["relevance_score"], reverse=True)
+
+    # 推薦メッセージ
+    selected_names = [s["name"] for s in source_info if s["selected"]]
+    selected_keys = [s["source_key"] for s in source_info if s["selected"]]
+    suggestion = (
+        f"クエリ「{query}」に対して、以下のソースを推薦します: {', '.join(selected_names)}。\n"
+        f"search_all を実行する場合: search_all(query=\"{query}\", sources=\"{','.join(selected_keys)}\")"
+    )
+
+    result = {
+        "query": query,
+        "recommendation": suggestion,
+        "sources": source_info,
+        "suggested_sources_param": ",".join(selected_keys),
+        "threshold": selection["threshold"],
+    }
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool
+def search_all(query: str, sources: str = "hf,gemini,local,files", mode: str = "all") -> str:
     """複数のRAGソース(HF/Gemini/内部DB/ローカルファイル)を並列検索し、結果を統合・比較します。
+
+    ■ 2つの検索モード:
+    - mode="all"（デフォルト）: sources で指定された全ソースに対して並列検索します。
+    - mode="auto": クエリ内容を自動分析し、関連度の高いソースのみを選択して検索します。
+      sourcesパラメータは候補リストとして扱われ、その中から自動絞り込みされます。
+
+    ■ ソース選択を自分で行いたい場合:
+    先に recommend_sources ツールでソース推薦を取得し、
+    その結果を基に sources を指定して mode="all" で呼び出してください。
 
     検索結果には全ソースからの「📚 参照元」一覧が関連度順で含まれます。
 
@@ -1188,9 +1366,17 @@ def search_all(query: str, sources: str = "hf,gemini,local,files") -> str:
 
     Args:
         query: 検索クエリ
-        sources: 検索ソース（カンマ区切り: hf,gemini,local,files）
+        sources: 検索ソース候補（カンマ区切り: hf,gemini,local,files）
+        mode: 検索モード — "all"（全ソース検索）または "auto"（自動選択）
     """
     source_list = [s.strip().lower() for s in sources.split(",")]
+
+    # ソース自動選択（mode="auto" の場合）
+    source_selection = None
+    if mode == "auto":
+        source_selection = _auto_select_sources(query, source_list)
+        source_list = source_selection["selected"]
+        logger.info(f"Auto-selected sources for '{query}': {source_list} (scores: {source_selection['scores']})")
 
     # ソース別の呼び出し関数マップ
     call_map = {
@@ -1221,6 +1407,14 @@ def search_all(query: str, sources: str = "hf,gemini,local,files") -> str:
                 }
 
     merged = _merge_results(results_dict, query)
+
+    # auto モードの場合、ソース選択情報を追加
+    if source_selection:
+        merged["mode"] = "auto"
+        merged["source_selection"] = source_selection
+    else:
+        merged["mode"] = "all"
+
     return json.dumps(merged, ensure_ascii=False, indent=2)
 
 
