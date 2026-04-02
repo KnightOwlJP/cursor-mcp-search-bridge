@@ -1225,8 +1225,10 @@ def _compute_source_relevance(query: str, source_key: str) -> float:
     query_tokens = tokenize(query)
     query_tokens_set = set(query_tokens)
 
-    # キーワードマッチ数
+    # キーワード完全一致（部分文字列）
     keyword_hits = sum(1 for kw in keywords if kw.lower() in query_lower)
+    # strengths 一致
+    strength_hits = sum(1 for s in strengths if s.lower() in query_lower)
     # N-gram マッチ（日本語キーワード用）
     ngram_hits = 0
     for kw in keywords:
@@ -1234,17 +1236,22 @@ def _compute_source_relevance(query: str, source_key: str) -> float:
         if kw_tokens and query_tokens_set & set(kw_tokens):
             ngram_hits += 1
 
-    total_hits = keyword_hits + ngram_hits
-    max_possible = len(keywords) * 2  # keyword + ngram の最大
+    # 重み付きスコア: 完全一致を重視
+    weighted_score = (keyword_hits * 3.0 + strength_hits * 2.0 + ngram_hits * 1.0)
+    max_possible = len(keywords) * 3.0 + len(strengths) * 2.0 + len(keywords) * 1.0
 
-    # スコア計算: ヒット率 + ベースライン
     if max_possible > 0:
-        hit_ratio = total_hits / max_possible
+        hit_ratio = weighted_score / max_possible
     else:
         hit_ratio = 0.0
 
-    # 0.1（ベースライン）〜 1.0 の範囲にマッピング
-    score = min(1.0, 0.1 + hit_ratio * 0.9)
+    # 1つでもキーワードヒットがあればベースラインを上げる
+    if keyword_hits > 0 or strength_hits > 0:
+        base = 0.2
+    else:
+        base = 0.05
+
+    score = min(1.0, base + hit_ratio * (1.0 - base))
     return round(score, 3)
 
 
