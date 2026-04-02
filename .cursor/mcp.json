@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "plant-design-rag": {
+      "type": "streamableHttp",
+      "url": "http://localhost:8000/mcp"
+    }
+  }
+}
